@@ -1,5 +1,8 @@
 name: uv Lock Update
-description: Runs `uv lock --upgrade` and opens or refreshes a single pull request with the lock file changes
+description: >-
+  Runs `uv lock --upgrade` and opens or refreshes a single pull request with
+  the lock file changes. Optionally keeps [tool.uv] required-version aligned
+  with the uv version Dependabot's updater image ships.
 inputs:
   app_id:
     description: GitHub App ID for authenticated pushes. Required unless dry_run is true.
@@ -18,23 +21,21 @@ inputs:
   labels:
     description: Labels to apply to the pull request
     default: dependencies
+  track_dependabot_uv:
+    description: >-
+      Keep [tool.uv] required-version compatible with the uv version
+      Dependabot's latest updater image ships, and regenerate the lock file
+      with that same uv. No pin, no effect.
+    default: "false"
   dry_run:
     description: If 'true', report intended actions without pushing or modifying pull requests
     default: "false"
-  exclude_newer:
-    description: >-
-      Cutoff passed to uv as UV_EXCLUDE_NEWER, so the upgrade ignores releases
-      published after it. Accepts anything uv's --exclude-newer does: a date, an
-      RFC 3339 timestamp, a duration such as '30 days', or 'false' to disable the
-      cutoff. Pass "" to leave the cutoff to the project's own uv configuration.
-    default: 7 days
 
 runs:
   using: composite
   steps:
-    # A dry run only reads, so it needs no app token and stays usable before an
-    # App is configured. Real runs push and open pull requests, so they require
-    # one and the next step fails fast when it is missing.
+    # A dry run only reads, so it needs no app token and works before an App
+    # is configured. Real runs push, so the next step fails fast without one.
     - name: Generate app token
       id: app-token
       if: inputs.dry_run != 'true' && inputs.app_id != '' && inputs.private_key != ''
@@ -44,8 +45,6 @@ runs:
         private-key: ${{ inputs.private_key }}
         permission-contents: write
         permission-pull-requests: write
-      env:
-        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     - name: Require an app token outside dry runs
       if: inputs.dry_run != 'true' && (inputs.app_id == '' || inputs.private_key == '')
@@ -65,38 +64,90 @@ runs:
         fi
         cp uv.lock "$OLD_LOCK"
 
+    # Gated on the tracking input; every tracking failure degrades to a
+    # warning and a plain lock update, so the weekly pull request keeps shipping.
+    - name: Resolve Dependabot's uv version
+      id: dependabot-uv
+      if: inputs.track_dependabot_uv == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.dry_run == 'true' && github.token || steps.app-token.outputs.token }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        if version=$("$ACTION_PATH/dependabot_uv.sh"); then
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "Dependabot's updater image ships uv $version"
+        else
+          echo "::warning::Could not determine the uv version in Dependabot's updater image; skipping required-version alignment. The lock update continues with the uv on PATH."
+          echo "available=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Installing before the align step keeps a failed download from
+    # stranding a rewritten pin the uv on PATH could no longer lock with.
+    - name: Install Dependabot's uv
+      id: install-uv
+      if: inputs.track_dependabot_uv == 'true' && steps.dependabot-uv.outputs.available == 'true'
+      shell: bash
+      env:
+        DEPENDABOT_UV: ${{ steps.dependabot-uv.outputs.version }}
+      run: ${{ github.action_path }}/install_uv.sh
+
+    - name: Align required-version with Dependabot's uv
+      id: align-pin
+      if: inputs.track_dependabot_uv == 'true' && steps.install-uv.outputs.uv_bin != ''
+      shell: bash
+      env:
+        DEPENDABOT_UV: ${{ steps.dependabot-uv.outputs.version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        # --no-config: the workspace pin may reject the uv on PATH in exactly
+        # the run that rewrites it. Exit 0 is every handled case; 2 fails.
+        uv run --no-project --no-config --python '>=3.11' --with packaging \
+          python "$ACTION_PATH/align_uv_pin.py" pyproject.toml "$DEPENDABOT_UV"
+
     - name: Upgrade the lock file
       shell: bash
       env:
-        EXCLUDE_NEWER: ${{ inputs.exclude_newer }}
+        # Dependabot's uv only runs this workspace when the pin accepts it;
+        # anything else falls back to the uv on PATH.
+        UV_BIN: ${{ steps.align-pin.outputs.compatible == 'true' && steps.install-uv.outputs.uv_bin || '' }}
       run: |
-        # UV_EXCLUDE_NEWER outranks the project's uv configuration, and uv
-        # rejects it when empty, so an empty input clears the variable rather
-        # than passing the empty value through. Clearing it also drops any
-        # UV_EXCLUDE_NEWER the caller's workflow exported, so the input alone
-        # decides the cutoff.
-        if [ -n "$EXCLUDE_NEWER" ]; then
-          export UV_EXCLUDE_NEWER="$EXCLUDE_NEWER"
+        if [ -n "$UV_BIN" ]; then
+          "$UV_BIN" lock --upgrade
         else
-          unset UV_EXCLUDE_NEWER
+          uv lock --upgrade
         fi
-        uv lock --upgrade
 
-    - name: Create or update the pull request
+    - name: Commit and summarize the upgrade
+      id: prepare
       shell: bash
       env:
-        # Only a dry run may use github.token. A live run gets the app token or
-        # nothing, so a future edit cannot silently reintroduce a fallback that
-        # opens pull requests CI will never run on.
+        # Only a dry run may use github.token. A live run gets the app token
+        # or nothing, so no future edit can reintroduce a fallback that opens
+        # pull requests CI never runs on.
         GH_TOKEN: ${{ inputs.dry_run == 'true' && github.token || steps.app-token.outputs.token }}
-        # Target the repository explicitly rather than letting gh infer it from
-        # the git remote, so the pull request lookup cannot depend on how the
-        # caller configured its checkout.
-        GH_REPO: ${{ github.repository }}
         BRANCH: ${{ inputs.branch }}
-        BASE: ${{ inputs.base || github.ref_name }}
-        LABELS: ${{ inputs.labels }}
         DRY_RUN: ${{ inputs.dry_run }}
         OLD_LOCK: ${{ runner.temp }}/uv.lock.before
         ACTION_PATH: ${{ github.action_path }}
+        ALIGNED: ${{ steps.align-pin.outputs.aligned }}
+        OLD_PIN: ${{ steps.align-pin.outputs.old_pin }}
+        NEW_PIN: ${{ steps.align-pin.outputs.new_pin }}
+        DEPENDABOT_UV: ${{ steps.dependabot-uv.outputs.version }}
+        UV_BIN: ${{ steps.align-pin.outputs.compatible == 'true' && steps.install-uv.outputs.uv_bin || '' }}
       run: ${{ github.action_path }}/update_lock.sh
+
+    # Skipped when nothing changed, so a quiet run never touches an existing
+    # pull request.
+    - name: Create or update the pull request
+      if: steps.prepare.outputs.changed == 'true'
+      uses: $/open-or-update-pr
+      with:
+        token: ${{ inputs.dry_run == 'true' && github.token || steps.app-token.outputs.token }}
+        branch: ${{ inputs.branch }}
+        base: ${{ inputs.base || github.ref_name }}
+        title: "Automation: Update uv.lock"
+        body: ${{ steps.prepare.outputs.body }}
+        labels: ${{ inputs.labels }}
+        dry_run: ${{ inputs.dry_run }}

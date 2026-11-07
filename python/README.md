@@ -158,19 +158,38 @@ GitHub rejects a pull request that asks for an unknown one.
 Set `dry_run: true` to log the branch and pull request the action would have
 created, without pushing or opening anything.
 
-The upgrade skips releases published within the last 7 days, so a broken or
-compromised release has time to be yanked before it can land in the lock file.
-Change the cutoff with `exclude_newer`, which takes anything uv's
-`--exclude-newer` accepts: a date, an RFC 3339 timestamp, a duration such as
-`30 days`, or `false` to upgrade to the newest releases with no cutoff at all.
-It reaches uv as `UV_EXCLUDE_NEWER`, so it overrides an `exclude-newer` the
-repository sets in `pyproject.toml` or `uv.toml`. Pass `exclude_newer: ""` to
-leave that setting in charge instead.
+### Tracking Dependabot's uv
+
+GitHub-hosted Dependabot runs the uv baked into its updater image, not the
+uv your `[tool.uv] required-version` pin asks for
+([dependabot-core#13199](https://github.com/dependabot/dependabot-core/issues/13199)).
+The day the two diverge, Dependabot security updates stop arriving, with no
+pull request and no failed check to show for it.
+
+Set `track_dependabot_uv: true` to close that gap. The action resolves the
+uv version from the `uv/Dockerfile` of the newest `dependabot-core` release
+tag, and:
+
+- Rewrites a pin that does not accept that version to
+  `>=<dependabot uv>,<next minor>`, so Dependabot's uv is the floor and
+  later patch releases flow without another rewrite.
+- Commits the aligned pin in the same pull request as the lock update.
+- Regenerates the lock file with exactly that uv binary.
+- Emits a warning, skips alignment, and completes the lock update with the
+  uv on `PATH` when Dependabot's uv version cannot be determined. The next
+  run self-corrects.
+
+A week where the pin already accepts Dependabot's uv changes nothing. A
+repository without a pin gets a notice and no other change.
 
 ```yaml
       - uses: mongodb-labs/drivers-github-tools/python/uv-lock-update@v3
         with:
           app_id: ${{ vars.APP_ID }}
           private_key: ${{ secrets.APP_PRIVATE_KEY }}
-          exclude_newer: 14 days
+          track_dependabot_uv: true
 ```
+
+The action sets no resolution cutoff. A repo that wants to hold back newly
+published packages configures `exclude-newer` in its own `pyproject.toml` or
+`uv.toml`, exactly as for `python/setup`.
